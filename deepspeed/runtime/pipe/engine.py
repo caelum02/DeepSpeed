@@ -856,8 +856,9 @@ class PipelineEngine(DeepSpeedEngine):
 
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
-            out_tensors = [t for t in outputs if t.is_floating_point()]
+            out_tensors = [t for t in outputs if t.is_floating_point() and t.requires_grad]
             assert len(out_tensors) == len(grad_tensors)
+            grad_tensors = [g for t, g in zip(out_tensors, grad_tensors) if t.requires_grad]
             torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
         else:
             torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
@@ -1100,7 +1101,10 @@ class PipelineEngine(DeepSpeedEngine):
                     if not buffer.is_floating_point():
                         assert buffer.grad is None
                         continue
-                    assert buffer.grad is not None
+
+                    if buffer.grad is None:
+                        continue
+
                     p2p.send(buffer.grad, self.prev_stage)
 
         # We can free up the input buffer now
@@ -1194,7 +1198,7 @@ class PipelineEngine(DeepSpeedEngine):
                                         for t in outputs[:2]] + [(list(t.size()), t.dtype)
                                                                  for t in outputs[2:] if t.is_floating_point()]
                 else:
-                    sizes_and_dtypes = [(list(t.size()), t.dtype) for t in outputs if t.is_floating_point()]
+                    sizes_and_dtypes = [(list(t.size()), t.dtype) for t in outputs if t.is_floating_point() and t.requires_grad]
 
                 self.grad_layer = [
                     self._allocate_or_extend_buffers(i, size, dtype)
@@ -1209,7 +1213,10 @@ class PipelineEngine(DeepSpeedEngine):
                 # XXX GPT-2 hack
                 if self.is_grad_partitioned and idx == 0 and buffer.dtype != torch.long:
                     buffer.data = torch.zeros(buffer.size(), dtype=torch.long, device=self.device)
-                p2p.recv(buffer, self.next_stage)
+                if outputs[idx].requires_grad:
+                    p2p.recv(buffer, self.next_stage)
+                else:
+                    continue
 
         if self.wall_clock_breakdown():
             self.timers(PIPE_RECV_GRAD_TIMER).stop()
